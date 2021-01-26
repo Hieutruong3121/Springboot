@@ -1,0 +1,234 @@
+pipeline {
+   agent { label 'docker' }
+
+   parameters {
+      string(name: 'GIT_BRANCH', defaultValue: 'master', description: 'Git branch to build')
+   }
+
+   environment {
+      PRODUCT_RELEASE   = '0.1.0'
+      PRODUCT_VERSION   = "${PRODUCT_RELEASE}-${BUILD_NUMBER}"
+      APP_IMAGE         = 'minhluantran017/demo-springboot_app'
+      DB_IMAGE          = 'minhluantran017/demo-springboot_db'
+
+      // Anchore server URL should be set in Global environment variables of Jenkins 
+      // ANCHORE_URL    = 'sec-tools.example.com'
+      ANCHORE_CRED      = credentials('anchore-usrpwd-cred')
+
+      // Artifactory URL should be set in Global environment variables of Jenkins
+      // ARTIFACTORY_URL= 'http://artifactory.example.com:8081/artifactory'
+      ARTIFACTORY_CRED  = credentials('artifactory-api-cred')
+      ARTIFACTORY_PATH  = "demo-springboot/${PRODUCT_RELEASE}/Artifacts/${BUILD_NUMBER}"
+
+      // Docker registry URL should be set in Global environment variables of Jenkins 
+      // REGISTRY_URL   = 'docker.io' or 'artifacts.example.com:5000'
+      REGISTRY_CRED     = 'registry-api-cred'
+
+      // Kubernetes kube config file
+      K8S_CONFIG        = credentials("k8s-${DEPLOY_MODE}-config-file")
+
+      MAVEN    = "docker run -it --rm -v ${WORKSPACE}:/apps -w /apps maven:3-jdk-8 mvn"
+      NEWMAN   = "docker run -it -v ${WORKSPACE}/tests/functional:/test -w /test postman/newman:5-alpine newman"
+      JMETER   = "docker run -it -v ${WORKSPACE}/tests/performance:/test -w /test justb4/jmeter jmeter"
+      ANCHORE  = "curl -s https://ci-tools.anchore.io/inline_scan-latest | bash -s -- \
+                     -u ${ANCHORE_CRED_USER} -p ${ANCHORE_CRED_PSW} -r ${ANCHORE_URL}"
+      HELM     = "docker run -it --rm -v ${WORKSPACE}:/apps -w /apps \
+                  -v ${K8S_CONFIG}:/root/.kube/config alpine/helm:3-alpine helm"
+   }
+   options {
+      timestamps()
+      timeout(60)
+      buildDiscarder logRotator(artifactDaysToKeepStr: '10', artifactNumToKeepStr: '100', 
+                                 daysToKeepStr: '30', numToKeepStr: '300')
+   }
+   triggers {
+      // Trigger at 8am daily 
+      cron ('0 8 * * *')
+   }
+   stages {
+      stage('Compile') {
+         steps {
+            print "Compiling code..."
+            script {
+               sh """
+                  ${MAVEN} clean package -Drelease=${PRODUCT_RELEASE} -DbuildNumber=${BUILD_NUMBER}
+                  mkdir -p artifacts
+                  cp target/*.war artifacts/demo-springboot.war
+               """
+            }
+         }
+      }
+      stage('Package') {
+         parallel {
+            stage('Package::App') {
+               steps {
+                  print "Packaging app..."
+                  script {
+                     sh """
+                        docker build -f build/docker/app.dockerfile . -t ${APP_IMAGE}:${PRODUCT_VERSION}
+                        docker save ${APP_IMAGE}:${PRODUCT_VERSION} \
+                           -o artifacts/demo-springboot_app_${PRODUCT_VERSION}.tar
+                     """
+                  }
+               }
+            }
+            stage('Package::Database') {
+               steps {
+                  print "Packaging db..."
+                  script {
+                     sh """
+                        docker build -f build/docker/db.dockerfile . -t ${DB_IMAGE}:${PRODUCT_VERSION}
+                        docker save ${DB_IMAGE}:${PRODUCT_VERSION} \
+                           -o artifacts/demo-springboot_db_${PRODUCT_VERSION}.tar
+                     """
+                  }
+               }
+            }
+         }
+      }
+      stage('Analyze') {
+         parallel {
+            stage('Analyze::App') {
+               steps {
+                  print "Analyzing application..."
+                  script {
+                     sh "${ANCHORE} ${APP_IMAGE}:${PRODUCT_VERSION}"
+                  }
+               }
+            }
+            stage('Analyze::Database') {
+               steps {
+                  print "Analyzing database..."
+                  script {
+                     sh "${ANCHORE} ${DB_IMAGE}:${PRODUCT_VERSION}"
+                  }
+               }
+            }
+         }
+         
+      }
+      stage('Upload') {
+         parallel {
+            stage('Upload::Artifactory') {
+               steps {
+                  print "Uploading binaries to artifactory..."
+                  dir('artifacts') {
+                     sh """
+                        md5sum * >> MD5SUMS.txt
+                        for file in `ls .`; do
+                           curl -s -X PUT -H "X-JFrog-Art-Api:${ARTIFACTORY_CRED}" -T ${file}\
+                              "${ARTIFACTORY_URL}/${ARTIFACTORY_PATH}/"
+                        done
+                     """
+                  }
+               }
+            }
+            stage('Upload::Registry') {
+               steps {
+                  script {
+                     withDockerRegistry(credentialsId: env.REGISTRY_CRED, url: env.REGISTY_URL) {
+                        print 'Uploading images to registry...'
+                        sh """
+                           docker push ${APP_IMAGE}:${PRODUCT_VERSION}
+                           docker push ${APP_IMAGE}:${PRODUCT_VERSION}
+                        """
+                     }
+                  }
+               }
+            }
+         }
+      }
+      stage('Deploy') {
+         parallel {
+            stage('Deploy::Dev') {
+               steps {
+                  print "Deploying app to dev environment..."
+                  script {
+                     sh "docker-compose -f deploy/docker-compose/compose.yml up -d"
+                  }
+               }
+            }
+            stage('Deploy::Test') {
+               environment {
+                  MODE = 'test'
+               }
+               steps {
+                  print "Deploying app to test environment..."
+                  script {
+                     print "TODO: Helm chart into test env"
+                     sh "${HELM} version"
+                  }
+               }
+            }
+            stage('Deploy::Staging') {
+               environment {
+                  MODE = 'staging'
+               }
+               steps {
+                  print "Deploying app to staging environment..."
+                  script {
+                     print "TODO: Helm chart into staging env"
+                     sh "${HELM} version"
+                  }
+               }
+            }
+         }
+      }
+      stage('Test') {
+         parallel {
+            stage('Test::Integration') {
+               steps {
+                  print 'Running integration test...'
+                  script {
+                     print "TODO: Run Newman API test"
+                  }
+               }
+               post {
+                  always {
+                     junit allowEmptyResults: true, testResults: 'tests/integration/newman-report.xml'
+                  }
+               }
+            }
+            stage('Test::Functional') {
+               steps {
+                  print 'Running functional test...'
+                  script {
+                     print "TODO: Run Selenium test" 
+                  }
+               }
+               post {
+                  always {
+                     junit allowEmptyResults: true, testResults: 'tests/functional/maven-report.xml'
+                  }
+               }
+            }
+            stage('Test::Performance') {
+               steps {
+                  print 'Running performance test...'
+                  script {
+                     print "TODO: Run JMeter test"
+                  }
+               }
+               post {
+                  always {
+                     junit allowEmptyResults: true, testResults: 'tests/performance/jmeter-report.xml'
+                  }
+               }
+            }
+         }
+      }
+   }
+   post {
+      always {
+         echo 'Sending email to user...'
+         emailext(
+            subject: "[Jenkins] ${JOB_NAME} Build #${BUILD_NUMBER} - ${BUILD_RESULT}",
+            body: """
+               ${JOB_NAME} Build#${BUILD_NUMBER} - ${BUILD_RESULT}.\n
+               Please see detail at ${BUILD_URL}.
+            """,
+            recipientProviders: [ requestor(), culprits() ]
+         )
+      }
+   }
+}
